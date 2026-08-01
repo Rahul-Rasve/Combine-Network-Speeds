@@ -35,6 +35,9 @@ except ImportError:
     print("[!] Missing dependencies. Run:  pip install psutil requests")
     sys.exit(1)
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 
 # ──────────────────────────────────────────────
 # Helpers
@@ -78,28 +81,35 @@ class Adapter:
     interface_index: int = 0
 
 
-def get_default_gateway_for_interface(iface_name: str) -> Optional[str]:
-    """Parse `route print` to find the gateway for a named adapter."""
+def _default_routes() -> list[tuple[str, str, str]]:
+    """Parse `route print 0.0.0.0` active routes into (gateway, interface_ip, metric)."""
     _, out = run("route print 0.0.0.0")
-    # Find the interface index for the adapter name
-    iface_index = None
+    routes = []
+    active = False
     for line in out.splitlines():
-        if iface_name.lower() in line.lower():
-            parts = line.split()
-            if parts and parts[0].isdigit():
-                iface_index = parts[0]
-                break
-
-    if iface_index is None:
-        return None
-
-    for line in out.splitlines():
+        if line.strip().startswith("Network Destination"):
+            active = True
+            continue
+        if not active:
+            continue
         parts = line.split()
-        # Default route lines: Network=0.0.0.0  Mask=0.0.0.0  Gateway  Interface  Metric
         if len(parts) >= 5 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
-            if parts[3].startswith(iface_index) or True:  # best-effort
-                return parts[2]
+            routes.append((parts[2], parts[3], parts[4]))
+    return routes
+
+
+def get_default_gateway_for_interface(
+    iface_ip: str, routes: list[tuple[str, str, str]]
+) -> Optional[str]:
+    """Find the default gateway whose route is bound to the given local IP."""
+    for gw, local_ip, _ in routes:
+        if local_ip == iface_ip:
+            return gw
     return None
+
+
+FALLBACK_SECONDARY_HINTS = ["USB", "Ethernet", "Local Area Connection"]
+VIRTUAL_ADAPTER_HINTS = ["vEthernet", "VMware", "VirtualBox", "Loopback", "Npcap"]
 
 
 def detect_adapters(wifi_hint: str, usb_hint: str) -> tuple[Optional[Adapter], Optional[Adapter]]:
@@ -109,10 +119,15 @@ def detect_adapters(wifi_hint: str, usb_hint: str) -> tuple[Optional[Adapter], O
     """
     stats = psutil.net_if_stats()
     addrs = psutil.net_if_addrs()
+    routes = _default_routes()
 
-    def find(hint: str) -> Optional[Adapter]:
+    def find(hint: str, exclude: Optional[str] = None) -> Optional[Adapter]:
         for name, snic_list in addrs.items():
+            if name == exclude:
+                continue
             if hint.lower() not in name.lower():
+                continue
+            if any(v.lower() in name.lower() for v in VIRTUAL_ADAPTER_HINTS):
                 continue
             if not stats.get(name, None) or not stats[name].isup:
                 continue
@@ -121,13 +136,20 @@ def detect_adapters(wifi_hint: str, usb_hint: str) -> tuple[Optional[Adapter], O
                 if snic.family.name == "AF_INET":
                     ip = snic.address
                     break
-            if not ip:
+            if not ip or ip.startswith("169.254."):
                 continue
-            gw = get_default_gateway_for_interface(name)
+            gw = get_default_gateway_for_interface(ip, routes)
             return Adapter(name=name, ip=ip, gateway=gw or "")
         return None
 
-    return find(wifi_hint), find(usb_hint)
+    wifi = find(wifi_hint)
+    usb = find(usb_hint, exclude=wifi.name if wifi else None)
+    if not usb:
+        for hint in FALLBACK_SECONDARY_HINTS:
+            usb = find(hint, exclude=wifi.name if wifi else None)
+            if usb:
+                break
+    return wifi, usb
 
 
 # ──────────────────────────────────────────────
@@ -146,8 +168,9 @@ class RoutingManager:
         self.wifi = wifi
         self.usb = usb
         self._added: list[str] = []
+        self._original: list[tuple[str, str, str]] = []
 
-    def _route(self, action: str, dest: str, mask: str, gw: str, metric: int, iface_ip: str):
+    def _route(self, action: str, dest: str, mask: str, gw: str, metric: str, iface_ip: str) -> bool:
         cmd = (
             f"route {action} {dest} mask {mask} {gw} "
             f"metric {metric} IF {iface_ip}"
@@ -155,29 +178,43 @@ class RoutingManager:
         code, out = run(cmd)
         return code == 0
 
-    def apply(self):
+    def apply(self) -> None:
         """Add equal-metric default routes for both adapters."""
         print(f"\n[*] Adding routes for load balancing...")
-        # Remove existing default routes first (we'll restore on exit)
+        if not self.wifi.gateway and not self.usb.gateway:
+            print("[!] No gateway resolved for either adapter, leaving routing untouched.")
+            return
+
+        self._original = _default_routes()
         run("route delete 0.0.0.0 mask 0.0.0.0")
 
         for adapter in (self.wifi, self.usb):
             if not adapter.gateway:
                 print(f"[!] No gateway found for {adapter.name}, skipping route.")
                 continue
-            ok = self._route("add", "0.0.0.0", "0.0.0.0", adapter.gateway, 1, adapter.ip)
+            ok = self._route("add", "0.0.0.0", "0.0.0.0", adapter.gateway, "1", adapter.ip)
             if ok:
                 print(f"    ✔ Route via {adapter.name} ({adapter.gateway})")
                 self._added.append(adapter.gateway)
             else:
                 print(f"    ✘ Failed to add route for {adapter.name}")
 
-    def restore(self):
-        """Remove added routes; Windows restores its own defaults on reboot."""
-        print("\n[*] Restoring original routing (removing added routes)...")
+    def restore(self) -> None:
+        """Remove added routes and put back the original default route(s)."""
+        if not self._added and not self._original:
+            return
+        print("\n[*] Restoring original routing...")
         for gw in self._added:
             run(f"route delete 0.0.0.0 mask 0.0.0.0 {gw}")
-        print("[*] Done. Your adapters will reconnect their default routes automatically.")
+        failed = []
+        for gw, local_ip, metric in self._original:
+            if not self._route("add", "0.0.0.0", "0.0.0.0", gw, metric, local_ip):
+                failed.append(gw)
+        if failed:
+            print(f"[!] Failed to restore route(s) via {', '.join(failed)}.")
+            print("    Disable/re-enable the affected adapter to recover it.")
+        else:
+            print("[*] Done. Original default route(s) restored.")
 
 
 # ──────────────────────────────────────────────
